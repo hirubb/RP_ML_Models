@@ -29,22 +29,26 @@ print(f"Dataset shape: {df.shape}")
 print(f"Columns: {list(df.columns)}")
 
 # =========================================
-# 2. PREPROCESSING (FIXED)
+# 2. PREPROCESSING (ENHANCED)
 # =========================================
 df_model = df.drop(columns=["dev_id", "task_id"], errors="ignore")
 
+# ✅ NEW: Feature Engineering (Interaction Features)
+print("\nCreating interaction features...")
+df_model["skill_exp_inter"] = df_model["skill_match_score"] * df_model["experience_level"]
+df_model["workload_density"] = df_model["current_workload"] / (df_model["availability"] + 1)
+df_model["complexity_sp_ratio"] = df_model["task_complexity"] / (df_model["story_points"] + 1)
+
 # ✅ CRITICAL CHANGE: Only drop OUTCOMES that happen AFTER assignment
-# DO NOT drop skill_match_score and velocity_contribution
-# These are DERIVED features calculated AT PREDICTION TIME
 leakage_cols = ["completion_time", "defects"]
 df_model = df_model.drop(columns=leakage_cols, errors="ignore")
 
-print(f"\nFeatures kept for training:")
-print(f"  ✓ skill_match_score (derived from dev skills + task requirements)")
-print(f"  ✓ velocity_contribution (story points weighted by skill match)")
-print(f"\nFeatures dropped (outcomes):")
-print(f"  ✗ completion_time (known only after task done)")
-print(f"  ✗ defects (known only after task done)")
+print(f"\nFeatures kept for training (including new interactions):")
+print(f"  ✓ skill_match_score")
+print(f"  ✓ velocity_contribution")
+print(f"  ✓ skill_exp_inter (Skill Match × Experience)")
+print(f"  ✓ workload_density (Workload / Availability)")
+print(f"  ✓ complexity_sp_ratio (Complexity / Story Points)")
 
 # Target
 y = df_model["performance_score"]
@@ -69,58 +73,80 @@ print(f"  Train: {len(X_train)} rows")
 print(f"  Test:  {len(X_test)} rows")
 
 # =========================================
-# 3. DEFINE MODELS
+# 3. HYPERPARAMETER TUNING (NEW)
 # =========================================
-rf = RandomForestRegressor(
-    n_estimators=250,
-    max_depth=14,
-    min_samples_leaf=4,
-    random_state=42,
-    n_jobs=-1
-)
+from sklearn.model_selection import RandomizedSearchCV
 
-xgboost_model = xgb.XGBRegressor(
-    n_estimators=400,
-    max_depth=7,
-    learning_rate=0.04,
-    subsample=0.85,
-    colsample_bytree=0.85,
-    reg_alpha=0.1,
-    reg_lambda=1.0,
-    random_state=42,
-    n_jobs=-1,
-    verbosity=0
-)
+print("\n" + "="*70)
+print("TUNING HYPERPARAMETERS (This may take a minute...)")
+print("="*70)
 
-lightgbm_model = lgb.LGBMRegressor(
-    n_estimators=400,
-    max_depth=10,
-    learning_rate=0.04,
-    num_leaves=40,
-    subsample=0.85,
-    colsample_bytree=0.85,
-    reg_alpha=0.1,
-    reg_lambda=1.0,
-    random_state=42,
-    n_jobs=-1,
-    verbose=-1
+# A. Tune XGBoost
+print("Tuning XGBoost...")
+xgb_params = {
+    'n_estimators': [100, 200, 400],
+    'max_depth': [3, 5, 7, 10],
+    'learning_rate': [0.01, 0.05, 0.1],
+    'subsample': [0.7, 0.8, 0.9],
+    'colsample_bytree': [0.7, 0.8, 0.9]
+}
+xgb_search = RandomizedSearchCV(
+    xgb.XGBRegressor(random_state=42, n_jobs=-1, verbosity=0),
+    xgb_params, n_iter=10, cv=3, scoring='r2', random_state=42, n_jobs=-1
 )
+xgb_search.fit(X_train, y_train)
+best_xgb = xgb_search.best_estimator_
+print(f"  Best XGB Params: {xgb_search.best_params_}")
 
+# B. Tune LightGBM
+print("Tuning LightGBM...")
+lgb_params = {
+    'n_estimators': [100, 200, 400],
+    'max_depth': [-1, 5, 10, 15],
+    'num_leaves': [20, 31, 50, 70],
+    'learning_rate': [0.01, 0.05, 0.1]
+}
+lgb_search = RandomizedSearchCV(
+    lgb.LGBMRegressor(random_state=42, n_jobs=-1, verbose=-1),
+    lgb_params, n_iter=10, cv=3, scoring='r2', random_state=42, n_jobs=-1
+)
+lgb_search.fit(X_train, y_train)
+best_lgbm = lgb_search.best_estimator_
+print(f"  Best LGBM Params: {lgb_search.best_params_}")
+
+# C. Tune RandomForest
+print("Tuning RandomForest...")
+rf_params = {
+    'n_estimators': [100, 200, 300],
+    'max_depth': [None, 10, 20],
+    'min_samples_leaf': [1, 2, 4]
+}
+rf_search = RandomizedSearchCV(
+    RandomForestRegressor(random_state=42, n_jobs=-1),
+    rf_params, n_iter=5, cv=3, scoring='r2', random_state=42, n_jobs=-1
+)
+rf_search.fit(X_train, y_train)
+best_rf = rf_search.best_estimator_
+print(f"  Best RF Params: {rf_search.best_params_}")
+
+# =========================================
+# 4. DEFINE MODELS (USING TUNED ESTIMATORS)
+# =========================================
 stacking = StackingRegressor(
     estimators=[
-        ("rf", rf),
-        ("xgb", xgboost_model),
-        ("lgbm", lightgbm_model)
+        ("rf", best_rf),
+        ("xgb", best_xgb),
+        ("lgbm", best_lgbm)
     ],
-    final_estimator=Ridge(alpha=0.5),
+    final_estimator=Ridge(alpha=1.0),
     cv=5,
     n_jobs=-1
 )
 
 models = {
-    "Random Forest": rf,
-    "XGBoost": xgboost_model,
-    "LightGBM": lightgbm_model,
+    "Random Forest": best_rf,
+    "XGBoost": best_xgb,
+    "LightGBM": best_lgbm,
     "Stacking Ensemble": stacking
 }
 
@@ -130,8 +156,8 @@ models = {
 results = {}
 
 print("\n" + "="*70)
-print(f"{'Model':<20} {'MAE':>8} {'RMSE':>8} {'R²':>8} {'Time':>8}")
-print("="*70)
+print(f"{'Model':<20} {'MAE':>8} {'RMSE':>8} {'R²':>8} {'Acc %':>8} {'Time':>8}")
+print("="*75)
 
 for name, model in models.items():
     start = time.time()
@@ -144,16 +170,21 @@ for name, model in models.items():
     rmse = round(np.sqrt(mean_squared_error(y_test, y_pred)), 3)
     r2 = round(r2_score(y_test, y_pred), 3)
 
+    # Calculate Accuracy (1 - MAE/Mean)
+    mean_y = np.mean(y_test)
+    accuracy = round(max(0, 100 * (1 - mae / (mean_y + 1e-9))), 2)
+
     results[name] = {
         "model": model,
         "MAE": mae,
         "RMSE": rmse,
         "R2": r2,
+        "Accuracy": accuracy,
         "time": elapsed,
         "y_pred": y_pred
     }
 
-    print(f"{name:<20} {mae:>8} {rmse:>8} {r2:>8} {elapsed:>7}s")
+    print(f"{name:<20} {mae:>8} {rmse:>8} {r2:>8} {accuracy:>7}% {elapsed:>7}s")
 
 print("="*70)
 
@@ -183,9 +214,10 @@ print(f"\n{'='*70}")
 print(f"BEST MODEL: {best_name}")
 print(f"  CV R² Score: {cv_scores_dict[best_name]}")
 print(f"  Test R²:     {results[best_name]['R2']}")
+print(f"  Test Acc:    {results[best_name]['Accuracy']}%")
 print(f"  Test MAE:    {results[best_name]['MAE']}")
 print(f"  Test RMSE:   {results[best_name]['RMSE']}")
-print(f"{'='*70}")
+print(f"{'='*75}")
 
 # Retrain on full training data
 best_model.fit(X_train, y_train)
@@ -211,16 +243,16 @@ summary = pd.DataFrame([
         "Model": name,
         "R²": res["R2"],
         "MAE": res["MAE"],
-        "RMSE": res["RMSE"],
+        "Acc %": f"{res['Accuracy']}%",
         "CV R²": cv_scores_dict[name],
         "Selected": "✓" if name == best_name else ""
     }
     for name, res in results.items()
 ]).sort_values("R²", ascending=False)
 
-print("\n" + "="*70)
+print("\n" + "="*75)
 print("FINAL SUMMARY")
-print("="*70)
+print("="*75)
 print(summary.to_string(index=False))
 
 # =========================================

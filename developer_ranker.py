@@ -67,6 +67,13 @@ def rank_developers_for_task(
         story_points = task_profile.get("storyPoints", task_profile.get("story_points", 3))
         velocity_contribution = story_points * skill_match_score * (1 - burnout * 0.5)
 
+        # ✅ STEP 3: Interaction Features (New for Stacking V2)
+        skill_exp_inter = float(skill_match_score * dev["experience_level"])
+        workload_density = float(dev["current_workload"] / (dev["availability"] + 1))
+        task_complexity = int(task_profile.get("taskComplexity", task_profile.get("task_complexity", 5)))
+        story_points = int(task_profile.get("storyPoints", task_profile.get("story_points", 3)))
+        complexity_sp_ratio = float(task_complexity / (story_points + 1))
+
         # Build feature row (MUST have all training features)
         row = {
             "sprint_id": 0,  # For prediction, sprint_id is not relevant
@@ -74,8 +81,8 @@ def rank_developers_for_task(
             "skill_frontend": int(dev["skill_frontend"]),
             "skill_backend": int(dev["skill_backend"]),
             "skill_db": int(dev["skill_db"]),
-            "task_complexity": int(task_profile.get("taskComplexity", task_profile.get("task_complexity", 5))),
-            "story_points": int(task_profile.get("storyPoints", task_profile.get("story_points", 3))),
+            "task_complexity": task_complexity,
+            "story_points": story_points,
             "req_frontend": int(task_profile.get("reqFrontend", task_profile.get("req_frontend", 0))),
             "req_backend": int(task_profile.get("reqBackend", task_profile.get("req_backend", 0))),
             "req_db": int(task_profile.get("reqDb", task_profile.get("req_db", 0))),
@@ -87,6 +94,11 @@ def rank_developers_for_task(
             "skill_match_score": float(skill_match_score),
             "velocity_contribution": float(velocity_contribution),
             
+            # ✅ NEW: Interaction Features
+            "skill_exp_inter": skill_exp_inter,
+            "workload_density": workload_density,
+            "complexity_sp_ratio": complexity_sp_ratio,
+
             # One-hot task type
             "task_type_backend": 1 if task_type == "backend" else 0,
             "task_type_frontend": 1 if task_type == "frontend" else 0,
@@ -127,16 +139,16 @@ def rank_developers_for_task(
     skill_match_array = candidates_df["skill_match_score"].values
     raw_workloads = candidates_df["current_workload"].values.astype(float)
 
-    # ✅ WORKLOAD BALANCE: measures how close each developer's workload is
-    # to the TEAM AVERAGE — not to the max.  This way D1 can have 10 tasks
-    # and D2 only 2 tasks but if their story-point totals are similar they
-    # both score high on balance.  A developer far above average is penalised;
-    # one below average is rewarded, pulling the whole team toward equilibrium.
+    # ✅ WORKLOAD BALANCE: Ensures equal distribution by strictly preferring
+    # developers with lower current workloads.
+    # We use an exponential decay relative to the team mean. This creates a 
+    # strong pressure to fill up under-loaded developers before adding more 
+    # to those already at or above the average.
     mean_workload = raw_workloads.mean() if raw_workloads.mean() > 0 else 1.0
-    # Deviation ratio: 0 = at the mean (best balance), >0 = over-loaded
-    deviation_ratio = np.abs(raw_workloads - mean_workload) / (mean_workload + 1e-6)
-    # Convert to a 0-1 score where 1 = perfectly balanced, 0 = heavily imbalanced
-    workload_balance_array = np.exp(-deviation_ratio)   # smooth penalty curve
+    
+    # Score = exp(-workload / mean). 
+    # If mean=20: Dev(0)=>1.0, Dev(10)=>0.6, Dev(20)=>0.37, Dev(40)=>0.13
+    workload_balance_array = np.exp(-raw_workloads / (mean_workload + 1e-6))
     workload_balance_array = np.clip(workload_balance_array, 0, 1)
 
     logger.info(
@@ -155,12 +167,12 @@ def rank_developers_for_task(
 
     # =========================================
     # FINAL COMPOSITE SCORE
-    # Weights are tuned to prioritize skill match
+    # Adjusted weights to ensure fairer distribution (40% for workload balance)
     # =========================================
     final_score = (
-        pred_norm * 0.3 +           # ML prediction (30%)
-        skill_match_array * 50 +    # Skill match (50%) ← DOMINANT
-        workload_balance_array * 20 # Workload balance (20%) — deviation-from-mean
+        pred_norm * 0.2 +           # ML prediction (20%)
+        skill_match_array * 40 +    # Skill match (40%)
+        workload_balance_array * 40 # Workload balance (40%) ← STRONGER PRESSURE
     )
 
     # =========================================
