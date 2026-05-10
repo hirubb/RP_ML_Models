@@ -9,6 +9,9 @@ from typing import Dict, Any
 from developer_ranker import rank_developers_for_task, allocate_sprint, rank_sprint_tasks
 from explainability import ExplainabilityEngine, explain_ranking
 
+#import behaviour service
+from behavior_service import BehaviorService
+
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -371,6 +374,19 @@ def explain_recommendation(data: dict):
     except Exception as e:
         logger.error(f"✗ Error during explanation: {e}", exc_info=True)
         return {"error": str(e), "status": "error"}
+
+@app.post("/behavior/predict-all")
+def predict_all(data: dict):
+    sprint_logs = pd.DataFrame(data["logs"])
+
+    service = BehaviorService()
+
+    result_df = service.generate_behavioral_profile(sprint_logs)
+
+    return {
+        "developers": result_df.to_dict(orient="records")
+    }
+
 
 # =========================================
 # RUN APP
