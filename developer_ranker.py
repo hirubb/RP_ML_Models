@@ -125,7 +125,24 @@ def rank_developers_for_task(
     # EXTRACT FEATURES FOR FINAL SCORING
     # =========================================
     skill_match_array = candidates_df["skill_match_score"].values
-    workload_balance_array = 1 - (candidates_df["current_workload"].values / max(candidates_df["current_workload"].max(), 1))
+    raw_workloads = candidates_df["current_workload"].values.astype(float)
+
+    # ✅ WORKLOAD BALANCE: measures how close each developer's workload is
+    # to the TEAM AVERAGE — not to the max.  This way D1 can have 10 tasks
+    # and D2 only 2 tasks but if their story-point totals are similar they
+    # both score high on balance.  A developer far above average is penalised;
+    # one below average is rewarded, pulling the whole team toward equilibrium.
+    mean_workload = raw_workloads.mean() if raw_workloads.mean() > 0 else 1.0
+    # Deviation ratio: 0 = at the mean (best balance), >0 = over-loaded
+    deviation_ratio = np.abs(raw_workloads - mean_workload) / (mean_workload + 1e-6)
+    # Convert to a 0-1 score where 1 = perfectly balanced, 0 = heavily imbalanced
+    workload_balance_array = np.exp(-deviation_ratio)   # smooth penalty curve
+    workload_balance_array = np.clip(workload_balance_array, 0, 1)
+
+    logger.info(
+        f"  Workload balance — mean={mean_workload:.1f}, "
+        f"min={workload_balance_array.min():.3f}, max={workload_balance_array.max():.3f}"
+    )
 
     # =========================================
     # NORMALIZE ML PREDICTIONS
@@ -143,7 +160,7 @@ def rank_developers_for_task(
     final_score = (
         pred_norm * 0.3 +           # ML prediction (30%)
         skill_match_array * 50 +    # Skill match (50%) ← DOMINANT
-        workload_balance_array * 20 # Workload balance (20%)
+        workload_balance_array * 20 # Workload balance (20%) — deviation-from-mean
     )
 
     # =========================================
@@ -261,17 +278,57 @@ def rank_sprint_tasks(
 ) -> list:
     """
     Rank developers for each task in a sprint without final allocation.
-    This provides recommendations for an admin to choose from.
+    This provides top-N recommendations for an admin to choose from.
+
+    KEY DESIGN: We maintain a LIVE copy of dev_df and update the virtual
+    workload of the #1-ranked developer after each task.  This means that
+    if D1 is the best fit for T1, T2, and T3, their workload accumulates
+    as we process each task — so by T3 the ranking score reflects that D1
+    is already carrying a heavy load and other developers are promoted.
+
+    There is NO hard task-count cap.  A developer may legitimately handle
+    many tasks if they have low story-point workload; another may handle few
+    high-complexity tasks.  The workload_balance term in the final score
+    (deviation from team mean) naturally penalises over-concentration.
     """
     logger.info(f"📋 Generating recommendations for {len(tasks)} tasks...")
-    
+
+    # ✅ Use a MUTABLE copy so workload updates propagate across tasks
+    current_dev_df = dev_df.copy()
+
+    # Normalise column names once
+    column_mapping = {
+        'devid': 'dev_id',
+        'experienceinlevel': 'experience_level',
+        'skillfrontend': 'skill_frontend',
+        'skillbackend': 'skill_backend',
+        'skilldb': 'skill_db',
+        'currenttasks': 'current_tasks',
+        'currentworkload': 'current_workload',
+    }
+    for old_name, new_name in column_mapping.items():
+        if old_name in current_dev_df.columns:
+            current_dev_df = current_dev_df.rename(columns={old_name: new_name})
+
+    # Sort tasks by story points descending so high-complexity work is
+    # assigned first (matching allocate_sprint behaviour)
+    sorted_tasks = sorted(
+        tasks,
+        key=lambda x: x.get("storyPoints", x.get("story_points", 0)),
+        reverse=True
+    )
+
+    # We need to return results keyed by the ORIGINAL task order for the
+    # frontend, so we build a lookup dict.
     sprint_recommendations = []
 
-    for task in tasks:
-        # Rank developers for this specific task
+    for task in sorted_tasks:
+        story_points = task.get("storyPoints", task.get("story_points", 3))
+
+        # Rank all developers against the CURRENT workload snapshot
         ranking_df = rank_developers_for_task(
             task_profile=task,
-            dev_df=dev_df,
+            dev_df=current_dev_df,
             model=model,
             feature_columns=feature_columns
         )
@@ -284,5 +341,24 @@ def rank_sprint_tasks(
             "task_title": task.get("title", task.get("name", "Unnamed Task")),
             "recommendations": top_recommendations
         })
+
+        # ✅ VIRTUAL WORKLOAD UPDATE: give the rank-1 dev their expected load
+        # so the NEXT task's ranking reflects the already-accumulated workload.
+        # This is the key mechanism that prevents one developer from dominating
+        # every task's recommendation list.
+        if not ranking_df.empty:
+            top_dev_id = ranking_df.iloc[0]["dev_id"]
+            mask = current_dev_df['dev_id'] == top_dev_id
+            current_dev_df.loc[mask, "current_tasks"]    += 1
+            current_dev_df.loc[mask, "current_workload"] += story_points
+            # Decrease availability proportionally (floor at 0)
+            current_avail = current_dev_df.loc[mask, "availability"].values[0]
+            new_avail = max(0.0, float(current_avail) - (story_points * 5))
+            current_dev_df.loc[mask, "availability"] = new_avail
+            logger.info(
+                f"  📌 Virtual assign: {top_dev_id} → task {task.get('id')} "
+                f"(+{story_points} SP | workload now "
+                f"{current_dev_df.loc[mask, 'current_workload'].values[0]:.0f})"
+            )
 
     return sprint_recommendations
