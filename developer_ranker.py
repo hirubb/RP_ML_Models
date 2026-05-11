@@ -99,6 +99,10 @@ def rank_developers_for_task(
             "workload_density": workload_density,
             "complexity_sp_ratio": complexity_sp_ratio,
 
+            # ✅ BEHAVIORAL METRICS (Updated after each sprint)
+            "consistency": float(dev.get("consistency", 0.5)),
+            "learning_rate": float(dev.get("learning_rate", 0.1)),
+
             # One-hot task type
             "task_type_backend": 1 if task_type == "backend" else 0,
             "task_type_frontend": 1 if task_type == "frontend" else 0,
@@ -167,12 +171,18 @@ def rank_developers_for_task(
 
     # =========================================
     # FINAL COMPOSITE SCORE
-    # Adjusted weights to ensure fairer distribution (40% for workload balance)
+    # Incorporates ML performance, skill match, workload balance, and behavioral metrics
     # =========================================
+    # Extract behavioral metrics for weighting
+    consistency_array = candidates_df["consistency"].values if "consistency" in candidates_df.columns else np.array([0.5] * len(candidates_df))
+    learning_rate_array = candidates_df["learning_rate"].values if "learning_rate" in candidates_df.columns else np.array([0.1] * len(candidates_df))
+
     final_score = (
-        pred_norm * 0.2 +           # ML prediction (20%)
-        skill_match_array * 40 +    # Skill match (40%)
-        workload_balance_array * 40 # Workload balance (40%) ← STRONGER PRESSURE
+        pred_norm * 0.15 +           # ML prediction (15%)
+        skill_match_array * 35 +    # Skill match (35%)
+        workload_balance_array * 30 + # Workload balance (30%)
+        consistency_array * 10 +    # Consistency (10%)
+        learning_rate_array * 10    # Learning rate (10%)
     )
 
     # =========================================

@@ -41,6 +41,8 @@ class ExplainabilityEngine:
                                ml_score: float,
                                skill_match_score: float,
                                workload_balance: float,
+                               consistency: float,
+                               learning_rate: float,
                                final_score: float,
                                rank: int) -> Dict[str, Any]:
         """
@@ -71,14 +73,16 @@ class ExplainabilityEngine:
         # =========================================
         explanation["summary"] = self._generate_summary(
             developer_id, rank, final_score,
-            skill_match_score, workload_balance, task_profile
+            skill_match_score, workload_balance, 
+            consistency, learning_rate, task_profile
         )
 
         # =========================================
         # 2. SCORE BREAKDOWN (Component Analysis)
         # =========================================
         explanation["breakdown"] = self._explain_score_breakdown(
-            ml_score, skill_match_score, workload_balance, final_score
+            ml_score, skill_match_score, workload_balance, 
+            consistency, learning_rate, final_score
         )
 
         # =========================================
@@ -86,7 +90,8 @@ class ExplainabilityEngine:
         # =========================================
         explanation["strengths"] = self._identify_strengths(
             developer_id, dev_features, task_profile,
-            skill_match_score, workload_balance
+            skill_match_score, workload_balance,
+            consistency, learning_rate
         )
 
         # =========================================
@@ -112,6 +117,7 @@ class ExplainabilityEngine:
 
     def _generate_summary(self, dev_id: str, rank: int, final_score: float,
                           skill_match: float, workload_balance: float,
+                          consistency: float, learning_rate: float,
                           task_profile: Dict) -> str:
         """
         Generate a one-sentence explanation.
@@ -139,43 +145,66 @@ class ExplainabilityEngine:
         else:
             workload_phrase = "heavy workload"
 
-        return f"{prefix} {dev_id} has {skill_phrase} for {task_type} and {workload_phrase} (score: {final_score:.1f})"
+        if consistency > 0.7:
+            behavior_phrase = "high consistency"
+        elif learning_rate > 0.6:
+            behavior_phrase = "fast learning rate"
+        else:
+            behavior_phrase = "reliable performance"
+
+        return f"{prefix} {dev_id} has {skill_phrase} for {task_type}, {workload_phrase}, and {behavior_phrase} (score: {final_score:.1f})"
 
     def _explain_score_breakdown(self, ml_score: float, skill_match: float,
-                                  workload_balance: float, final_score: float) -> Dict:
+                                  workload_balance: float, consistency: float,
+                                  learning_rate: float, final_score: float) -> Dict:
         """
         Break down how the final score was calculated.
-        Weights: 30% ML + 50% skill_match + 20% workload
+        Weights: 15% ML + 35% Skill + 30% Workload + 10% Consistency + 10% Learning
         """
-        ml_contribution = (ml_score / max(ml_score, 1)) * 100 * 0.3 if ml_score > 0 else 0
-        skill_contribution = skill_match * 50
-        workload_contribution = workload_balance * 20
+        ml_contribution = (ml_score / max(ml_score, 1)) * 100 * 0.15 if ml_score > 0 else 0
+        skill_contribution = skill_match * 35
+        workload_contribution = workload_balance * 30
+        consistency_contribution = consistency * 10
+        learning_contribution = learning_rate * 10
 
         return {
             "ml_prediction": {
                 "value": round(ml_score, 2),
-                "weight": "30%",
+                "weight": "15%",
                 "contribution": round(ml_contribution, 2),
-                "explanation": "ML model's learned estimate of task completion success"
+                "explanation": "ML model's estimate of task success"
             },
             "skill_match": {
                 "value": round(skill_match, 3),
-                "weight": "50%",
+                "weight": "35%",
                 "contribution": round(skill_contribution, 2),
-                "explanation": "How well developer's skills align with task requirements"
+                "explanation": "Alignment with task requirements"
             },
             "workload_balance": {
                 "value": round(workload_balance, 3),
-                "weight": "20%",
+                "weight": "30%",
                 "contribution": round(workload_contribution, 2),
-                "explanation": "Developer's current availability and capacity"
+                "explanation": "Availability and capacity"
+            },
+            "consistency": {
+                "value": round(consistency, 2),
+                "weight": "10%",
+                "contribution": round(consistency_contribution, 2),
+                "explanation": "Historical performance stability"
+            },
+            "learning_rate": {
+                "value": round(learning_rate, 2),
+                "weight": "10%",
+                "contribution": round(learning_contribution, 2),
+                "explanation": "Speed of skill improvement"
             },
             "total": round(final_score, 2)
         }
 
     def _identify_strengths(self, dev_id: str, dev_features: pd.DataFrame,
                             task_profile: Dict, skill_match: float,
-                            workload_balance: float) -> List[Dict]:
+                            workload_balance: float, consistency: float,
+                            learning_rate: float) -> List[Dict]:
         """
         Identify top 3 reasons this developer is good for this task.
         """
@@ -259,6 +288,22 @@ class ExplainabilityEngine:
                 "strength": "Reasonable availability",
                 "detail": f"Can take on this task without excessive overload",
                 "metric": "Workload"
+            })
+
+        # =========================================
+        # Strength 4: Behavioral Metrics
+        # =========================================
+        if consistency > 0.8:
+            strengths.append({
+                "strength": "Highly consistent performance",
+                "detail": "Historically maintains very stable delivery times and quality",
+                "metric": "Behavior"
+            })
+        elif learning_rate > 0.7:
+            strengths.append({
+                "strength": "Exceptional learning rate",
+                "detail": "Demonstrates rapid skill acquisition and improvement",
+                "metric": "Behavior"
             })
 
         return strengths[:3]  # Top 3 only
@@ -447,6 +492,8 @@ def explain_ranking(ranking_df: pd.DataFrame,
             ml_score=row["predicted_performance"],
             skill_match_score=row["skill_match_score"],
             workload_balance=row["workload_balance"],
+            consistency=row.get("consistency", 0.5),
+            learning_rate=row.get("learning_rate", 0.1),
             final_score=row["final_score"],
             rank=row["rank"]
         )

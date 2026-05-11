@@ -227,6 +227,8 @@ def allocate_sprint_endpoint(data: dict):
                 ml_score=top_dev_row["predicted_performance"],
                 skill_match_score=top_dev_row["skill_match_score"],
                 workload_balance=top_dev_row["workload_balance"],
+                consistency=top_dev_row.get("consistency", 0.5),
+                learning_rate=top_dev_row.get("learning_rate", 0.1),
                 final_score=top_dev_row["final_score"],
                 rank=int(top_dev_row["rank"])
             )
@@ -300,6 +302,8 @@ def rank_sprint_endpoint(data: dict):
                     ml_score=dev_rec["predicted_performance"],
                     skill_match_score=dev_rec["skill_match_score"],
                     workload_balance=dev_rec["workload_balance"],
+                    consistency=dev_rec.get("consistency", 0.5),
+                    learning_rate=dev_rec.get("learning_rate", 0.1),
                     final_score=dev_rec["final_score"],
                     rank=int(dev_rec["rank"])
                 )
@@ -361,6 +365,8 @@ def explain_recommendation(data: dict):
             ml_score=ml_score,
             skill_match_score=skill_match,
             workload_balance=workload_balance,
+            consistency=data.get("consistency", 0.5),
+            learning_rate=data.get("learning_rate", 0.1),
             final_score=final_score,
             rank=1
         )
