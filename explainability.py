@@ -65,7 +65,7 @@ class ExplainabilityEngine:
             "strengths": [],
             "concerns": [],
             "shap_explanation": None,
-            "recommendation_confidence": self._calculate_confidence(final_score, rank)
+            "recommendation_confidence": self._calculate_confidence(final_score, rank, ml_score)
         }
 
         # =========================================
@@ -291,15 +291,22 @@ class ExplainabilityEngine:
             })
 
         # =========================================
-        # Strength 4: Behavioral Metrics
+        # Strength 4: Behavioral Metrics & Growth
         # =========================================
-        if consistency > 0.8:
+        task_comp = int(task_profile.get("taskComplexity", task_profile.get("task_complexity", 5)))
+        if int(exp_level) <= 2 and task_comp <= 6 and learning_rate >= 0.5:
+            strengths.append({
+                "strength": "High growth & learning potential",
+                "detail": "Developer meets task baseline and has high learning velocity for manageable complexity",
+                "metric": "Growth"
+            })
+        elif consistency > 0.8:
             strengths.append({
                 "strength": "Highly consistent performance",
                 "detail": "Historically maintains very stable delivery times and quality",
                 "metric": "Behavior"
             })
-        elif learning_rate > 0.7:
+        elif learning_rate > 0.6:
             strengths.append({
                 "strength": "Exceptional learning rate",
                 "detail": "Demonstrates rapid skill acquisition and improvement",
@@ -437,19 +444,22 @@ class ExplainabilityEngine:
 
         return "; ".join(interpretations) + "."
 
-    def _calculate_confidence(self, final_score: float, rank: int) -> Dict:
+    def _calculate_confidence(self, final_score: float, rank: int, ml_score: float) -> Dict:
         """
         Calculate how confident we are in this recommendation.
+        Incorporates both relative ranking and raw ML success probability.
         """
-        if rank == 1 and final_score > 75:
+        is_low_ml = ml_score < 35
+        
+        if rank == 1 and final_score > 75 and not is_low_ml:
             confidence_level = "high"
             confidence_pct = 0.85
         elif rank <= 3 and final_score > 60:
             confidence_level = "medium"
-            confidence_pct = 0.70
+            confidence_pct = 0.70 if not is_low_ml else 0.55
         elif final_score > 50:
             confidence_level = "medium"
-            confidence_pct = 0.60
+            confidence_pct = 0.60 if not is_low_ml else 0.45
         else:
             confidence_level = "low"
             confidence_pct = 0.40
@@ -457,21 +467,25 @@ class ExplainabilityEngine:
         return {
             "level": confidence_level,
             "percentage": round(confidence_pct * 100),
-            "explanation": self._confidence_explanation(confidence_level, rank)
+            "explanation": self._confidence_explanation(confidence_level, rank, is_low_ml)
         }
 
-    def _confidence_explanation(self, confidence_level: str, rank: int) -> str:
+    def _confidence_explanation(self, confidence_level: str, rank: int, is_low_ml: bool) -> str:
         """
         Generate confidence explanation text.
         """
         if confidence_level == "high":
-            return "Strong recommendation - clear fit for this task"
+            return "Strong recommendation - clear fit for this task with high success probability"
         elif confidence_level == "medium":
+            if is_low_ml:
+                return "Best available choice, but model confidence is limited by lack of historical success data"
             if rank == 1:
                 return "Good recommendation - best available option"
             else:
                 return "Viable option - consider if top choice unavailable"
         else:
+            if is_low_ml:
+                return "Experimental option - limited historical data and lower success probability"
             return "Alternative option - may require additional support or monitoring"
 
 

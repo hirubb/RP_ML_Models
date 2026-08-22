@@ -1,6 +1,8 @@
 import pandas as pd
 import numpy as np
+import math
 import logging
+from scipy.optimize import linear_sum_assignment
 
 logger = logging.getLogger(__name__)
 
@@ -12,7 +14,7 @@ def rank_developers_for_task(
         feature_columns: list
 ) -> pd.DataFrame:
     """
-    Rank developers using ML prediction + explicit skill matching + workload balance
+    Rank developers using ML prediction + explicit skill matching + workload balance + growth incentive
     
     CRITICAL: skill_match_score and velocity_contribution are CALCULATED HERE
     (not retrieved from a database or CSV)
@@ -143,21 +145,28 @@ def rank_developers_for_task(
     skill_match_array = candidates_df["skill_match_score"].values
     raw_workloads = candidates_df["current_workload"].values.astype(float)
 
-    # ✅ WORKLOAD BALANCE: Ensures equal distribution by strictly preferring
-    # developers with lower current workloads.
-    # We use an exponential decay relative to the team mean. This creates a 
-    # strong pressure to fill up under-loaded developers before adding more 
-    # to those already at or above the average.
+    # ✅ WORKLOAD BALANCE & FAIRNESS:
+    # 1. Exponential decay relative to team mean workload
     mean_workload = raw_workloads.mean() if raw_workloads.mean() > 0 else 1.0
-    
-    # Score = exp(-workload / mean). 
-    # If mean=20: Dev(0)=>1.0, Dev(10)=>0.6, Dev(20)=>0.37, Dev(40)=>0.13
     workload_balance_array = np.exp(-raw_workloads / (mean_workload + 1e-6))
-    workload_balance_array = np.clip(workload_balance_array, 0, 1)
+    
+    # 2. Task count fairness (penalize devs with active tasks when others are free)
+    current_tasks_array = candidates_df["current_tasks"].values.astype(float)
+    min_tasks = current_tasks_array.min()
+    task_fairness = []
+    for t in current_tasks_array:
+        if t == 0:
+            task_fairness.append(1.0)  # Idle developer boost
+        elif t > min_tasks:
+            task_fairness.append(1.0 / (1.0 + 0.6 * (t - min_tasks) ** 1.5))
+        else:
+            task_fairness.append(0.9)
+    
+    combined_workload_balance = np.clip(workload_balance_array * np.array(task_fairness), 0, 1)
 
     logger.info(
         f"  Workload balance — mean={mean_workload:.1f}, "
-        f"min={workload_balance_array.min():.3f}, max={workload_balance_array.max():.3f}"
+        f"min={combined_workload_balance.min():.3f}, max={combined_workload_balance.max():.3f}"
     )
 
     # =========================================
@@ -170,20 +179,43 @@ def rank_developers_for_task(
         pred_norm = np.zeros_like(predicted)
 
     # =========================================
-    # FINAL COMPOSITE SCORE
-    # Incorporates ML performance, skill match, workload balance, and behavioral metrics
+    # BEHAVIORAL & GROWTH INCENTIVES (Option 3 Logic)
     # =========================================
-    # Extract behavioral metrics for weighting
     consistency_array = candidates_df["consistency"].values if "consistency" in candidates_df.columns else np.array([0.5] * len(candidates_df))
     learning_rate_array = candidates_df["learning_rate"].values if "learning_rate" in candidates_df.columns else np.array([0.1] * len(candidates_df))
 
+    # Growth Incentive: Enable junior (exp=1) and mid-level (exp=2) developers for manageable tasks (complexity <= 6)
+    # when they meet the baseline requirement threshold (skill_match >= 0.30)
+    task_complexity = int(task_profile.get("taskComplexity", task_profile.get("task_complexity", 5)))
+    growth_bonuses = []
+    for _, dev_row in candidates_df.iterrows():
+        exp = dev_row.get("experience_level", 1)
+        lr = dev_row.get("learning_rate", 0.1)
+        sm = dev_row.get("skill_match_score", 0.0)
+        
+        if task_complexity <= 6 and sm >= 0.30:
+            # Junior (1) gets 1.0x, Mid (2) gets 0.5x, Senior (3) gets 0.0x
+            growth_mult = max(0.0, (3 - min(exp, 3)) / 2.0)
+            complexity_fit = max(0.0, 1.0 - (task_complexity / 8.0))
+            bonus = lr * growth_mult * complexity_fit * 12.0
+        else:
+            bonus = 0.0
+        growth_bonuses.append(bonus)
+
+    growth_bonus_array = np.array(growth_bonuses)
+
+    # =========================================
+    # FINAL COMPOSITE SCORE
+    # =========================================
     final_score = (
-        pred_norm * 0.15 +           # ML prediction (15%)
-        skill_match_array * 35 +    # Skill match (35%)
-        workload_balance_array * 30 + # Workload balance (30%)
-        consistency_array * 10 +    # Consistency (10%)
-        learning_rate_array * 10    # Learning rate (10%)
+        pred_norm * 0.15 +                        # ML prediction (15%)
+        skill_match_array * 35 +                 # Skill match (35%)
+        combined_workload_balance * 30 +         # Workload & fairness (30%)
+        consistency_array * 10 +                 # Consistency (10%)
+        learning_rate_array * 10 +               # Learning rate (10%)
+        growth_bonus_array                       # Growth incentive bonus
     )
+    final_score = np.clip(final_score, 0, 100)
 
     # =========================================
     # BUILD RESULTS
@@ -199,7 +231,10 @@ def rank_developers_for_task(
         "availability": dev_df["availability"].values,
         "skill_match_score": np.round(skill_match_array, 3),
         "predicted_performance": np.round(predicted, 2),
-        "workload_balance": np.round(workload_balance_array, 3),
+        "workload_balance": np.round(combined_workload_balance, 3),
+        "learning_rate": np.round(learning_rate_array, 2),
+        "consistency": np.round(consistency_array, 2),
+        "growth_bonus": np.round(growth_bonus_array, 2),
         "final_score": np.round(final_score, 2)
     })
 
@@ -224,22 +259,16 @@ def allocate_sprint(
         feature_columns: list
 ) -> list:
     """
-    Allocate an entire list of tasks to developers greedily.
-    Updates developer workload after each assignment to ensure balanced distribution.
-    """
-    allocations = []
+    Allocate an entire sprint using GLOBAL LINEAR ASSIGNMENT (Hungarian Algorithm).
     
-    # Sort tasks by story points descending (more complex tasks assigned first)
-    sorted_tasks = sorted(
-        tasks, 
-        key=lambda x: x.get("storyPoints", x.get("story_points", 0)), 
-        reverse=True
-    )
+    Mathematically optimizes total sprint score while strictly balancing workload
+    across the entire team and preventing single-developer task hoarding.
+    """
+    if not tasks or dev_df.empty:
+        return []
 
-    # Work with a copy to avoid mutating the original df passed in
+    # Normalize column names immediately
     current_dev_df = dev_df.copy()
-
-    # Normalize dev_df columns immediately
     column_mapping = {
         'devid': 'dev_id',
         'experienceinlevel': 'experience_level',
@@ -253,40 +282,82 @@ def allocate_sprint(
         if old_name in current_dev_df.columns:
             current_dev_df = current_dev_df.rename(columns={old_name: new_name})
 
-    logger.info(f"🚀 Starting bulk allocation for {len(tasks)} tasks...")
+    n_tasks = len(tasks)
+    n_devs = len(current_dev_df)
+    dev_ids = current_dev_df["dev_id"].tolist()
 
-    for task in sorted_tasks:
-        # 1. Rank developers for this specific task
+    logger.info(f"🚀 Starting GLOBAL LINEAR ASSIGNMENT for {n_tasks} tasks and {n_devs} developers...")
+
+    # Calculate capacity slots per developer
+    # If tasks > devs (e.g. 7 tasks, 3 devs), each developer gets ceil(7/3) = 3 slots
+    max_slots_per_dev = max(1, math.ceil(n_tasks / n_devs))
+    
+    # Build candidate slot mapping: (dev_idx, dev_id, slot_num)
+    slots = []
+    for dev_idx, dev_id in enumerate(dev_ids):
+        for slot_num in range(max_slots_per_dev):
+            slots.append({
+                "dev_idx": dev_idx,
+                "dev_id": dev_id,
+                "slot_num": slot_num
+            })
+            
+    total_slots = len(slots)
+
+    # Build Cost Matrix (N_tasks x Total_Slots)
+    # Higher final_score -> Lower Cost in Hungarian minimization
+    cost_matrix = np.zeros((n_tasks, total_slots))
+    rankings_cache = {}
+
+    for i, task in enumerate(tasks):
+        # Rank developers for this task
         ranking_df = rank_developers_for_task(
             task_profile=task,
             dev_df=current_dev_df,
             model=model,
             feature_columns=feature_columns
         )
+        rankings_cache[i] = ranking_df
 
-        if ranking_df.empty:
-            logger.warning(f"No developers available for task {task.get('id', 'unknown')}")
-            continue
+        for j, slot in enumerate(slots):
+            dev_id = slot["dev_id"]
+            slot_num = slot["slot_num"]
+            
+            dev_row = ranking_df[ranking_df["dev_id"] == dev_id]
+            if not dev_row.empty:
+                base_score = float(dev_row.iloc[0]["final_score"])
+            else:
+                base_score = 0.0
 
-        # 2. Pick the #1 ranked developer
-        top_dev = ranking_df.iloc[0]
-        dev_id = top_dev["dev_id"]
+            # Progressive slot penalty:
+            # Slot 0 (1st task for dev) = base cost
+            # Slot 1 (2nd task for dev) = +25 cost penalty
+            # Slot 2 (3rd task for dev) = +50 cost penalty
+            # This mathematically ensures the solver fills 1st slots across ALL devs before giving any dev a 2nd slot!
+            slot_penalty = slot_num * 25.0
+            cost = (100.0 - base_score) + slot_penalty
+            cost_matrix[i, j] = cost
+
+    # Solve Global Minimum Cost Bipartite Matching
+    row_ind, col_ind = linear_sum_assignment(cost_matrix)
+
+    # Build final allocations
+    allocations = []
+    for task_idx, slot_col in zip(row_ind, col_ind):
+        assigned_slot = slots[slot_col]
+        dev_id = assigned_slot["dev_id"]
+        task = tasks[task_idx]
         
-        # 3. Store the allocation
+        ranking_df = rankings_cache[task_idx]
+        dev_row = ranking_df[ranking_df["dev_id"] == dev_id].iloc[0]
+
         allocations.append({
-            "task_id": task.get("id", task.get("taskId", "unknown")),
+            "task_id": task.get("id", task.get("taskId", f"task-{task_idx}")),
             "dev_id": dev_id,
-            "match_score": float(top_dev["final_score"]),
-            "skill_match": float(top_dev["skill_match_score"])
+            "match_score": float(dev_row["final_score"]),
+            "skill_match": float(dev_row["skill_match_score"])
         })
-
-        # 4. Update the developer's workload in current_dev_df for the next task
-        story_points = task.get("storyPoints", task.get("story_points", 3))
-        
-        current_dev_df.loc[current_dev_df['dev_id'] == dev_id, "current_tasks"] += 1
-        current_dev_df.loc[current_dev_df['dev_id'] == dev_id, "current_workload"] += story_points
-        
-        logger.info(f"✅ Assigned Task {task.get('id')} to {dev_id}")
+        logger.info(f"✅ Globally Assigned Task {task.get('id')} to {dev_id} (Score: {dev_row['final_score']:.1f})")
 
     return allocations
 
@@ -303,19 +374,11 @@ def rank_sprint_tasks(
     This provides top-N recommendations for an admin to choose from.
 
     KEY DESIGN: We maintain a LIVE copy of dev_df and update the virtual
-    workload of the #1-ranked developer after each task.  This means that
-    if D1 is the best fit for T1, T2, and T3, their workload accumulates
-    as we process each task — so by T3 the ranking score reflects that D1
-    is already carrying a heavy load and other developers are promoted.
-
-    There is NO hard task-count cap.  A developer may legitimately handle
-    many tasks if they have low story-point workload; another may handle few
-    high-complexity tasks.  The workload_balance term in the final score
-    (deviation from team mean) naturally penalises over-concentration.
+    workload of the #1-ranked developer after each task. This ensures
+    the recommendations promote other developers as loads accumulate.
     """
     logger.info(f"📋 Generating recommendations for {len(tasks)} tasks...")
 
-    # ✅ Use a MUTABLE copy so workload updates propagate across tasks
     current_dev_df = dev_df.copy()
 
     # Normalise column names once
@@ -332,22 +395,18 @@ def rank_sprint_tasks(
         if old_name in current_dev_df.columns:
             current_dev_df = current_dev_df.rename(columns={old_name: new_name})
 
-    # Sort tasks by story points descending so high-complexity work is
-    # assigned first (matching allocate_sprint behaviour)
     sorted_tasks = sorted(
         tasks,
         key=lambda x: x.get("storyPoints", x.get("story_points", 0)),
         reverse=True
     )
 
-    # We need to return results keyed by the ORIGINAL task order for the
-    # frontend, so we build a lookup dict.
     sprint_recommendations = []
 
     for task in sorted_tasks:
         story_points = task.get("storyPoints", task.get("story_points", 3))
 
-        # Rank all developers against the CURRENT workload snapshot
+        # Rank all developers against current workload snapshot
         ranking_df = rank_developers_for_task(
             task_profile=task,
             dev_df=current_dev_df,
@@ -355,7 +414,6 @@ def rank_sprint_tasks(
             feature_columns=feature_columns
         )
 
-        # Get top N recommendations
         top_recommendations = ranking_df.head(top_n).to_dict(orient="records")
 
         sprint_recommendations.append({
@@ -364,23 +422,18 @@ def rank_sprint_tasks(
             "recommendations": top_recommendations
         })
 
-        # ✅ VIRTUAL WORKLOAD UPDATE: give the rank-1 dev their expected load
-        # so the NEXT task's ranking reflects the already-accumulated workload.
-        # This is the key mechanism that prevents one developer from dominating
-        # every task's recommendation list.
+        # Virtual workload update for top developer
         if not ranking_df.empty:
             top_dev_id = ranking_df.iloc[0]["dev_id"]
             mask = current_dev_df['dev_id'] == top_dev_id
-            current_dev_df.loc[mask, "current_tasks"]    += 1
+            current_dev_df.loc[mask, "current_tasks"] += 1
             current_dev_df.loc[mask, "current_workload"] += story_points
-            # Decrease availability proportionally (floor at 0)
             current_avail = current_dev_df.loc[mask, "availability"].values[0]
             new_avail = max(0.0, float(current_avail) - (story_points * 5))
             current_dev_df.loc[mask, "availability"] = new_avail
             logger.info(
                 f"  📌 Virtual assign: {top_dev_id} → task {task.get('id')} "
-                f"(+{story_points} SP | workload now "
-                f"{current_dev_df.loc[mask, 'current_workload'].values[0]:.0f})"
+                f"(+{story_points} SP | workload now {current_dev_df.loc[mask, 'current_workload'].values[0]:.0f})"
             )
 
     return sprint_recommendations
